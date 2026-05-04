@@ -43,12 +43,14 @@ import contextlib
 import json
 import os
 import secrets
-import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+from hermes_db import create_backend
+from hermes_db.interface import DatabaseBackend
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +176,7 @@ class Task:
     skills: Optional[list] = None
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Task":
+    def from_row(cls, row) -> "Task":
         keys = set(row.keys())
         # Parse skills JSON blob if present
         skills_value: Optional[list] = None
@@ -254,7 +256,7 @@ class Run:
     error: Optional[str]
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Run":
+    def from_row(cls, row) -> "Run":
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
@@ -429,7 +431,7 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 _INITIALIZED_PATHS: set[str] = set()
 
 
-def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
+def connect(db_path: Optional[Path] = None) -> DatabaseBackend:
     """Open (and initialize if needed) the kanban DB.
 
     WAL mode is enabled on every connection; it's a no-op after the first
@@ -444,19 +446,22 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     needs_init = resolved not in _INITIALIZED_PATHS
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    backend = create_backend(
+        provider="sqlite",
+        db_path=str(path),
+    )
+    # Configure SQLite-specific settings
+    backend.execute("PRAGMA journal_mode=WAL")
+    backend.execute("PRAGMA synchronous=NORMAL")
+    backend.execute("PRAGMA foreign_keys=ON")
     if needs_init:
         # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
         # migrations. Cached so subsequent connect() calls in the same
         # process are cheap.
-        conn.executescript(SCHEMA_SQL)
-        _migrate_add_optional_columns(conn)
+        backend.executescript(SCHEMA_SQL)
+        _migrate_add_optional_columns(backend)
         _INITIALIZED_PATHS.add(resolved)
-    return conn
+    return backend
 
 
 def init_db(db_path: Optional[Path] = None) -> Path:
@@ -481,12 +486,12 @@ def init_db(db_path: Optional[Path] = None) -> Path:
     return path
 
 
-def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+def _migrate_add_optional_columns(conn: DatabaseBackend) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    cols = set(conn.get_table_columns("tasks").keys())
     if "tenant" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN tenant TEXT")
     if "result" not in cols:
@@ -523,7 +528,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
-    ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    ev_cols = set(conn.get_table_columns("task_events").keys())
     if "run_id" not in ev_cols:
         conn.execute("ALTER TABLE task_events ADD COLUMN run_id INTEGER")
         conn.execute(
@@ -538,9 +543,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # against any concurrent dispatcher, and the per-row UPDATE uses
     # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
     # produce an orphaned row if it interleaves with the backfill pass.
-    runs_exist = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
-    ).fetchone() is not None
+    runs_exist = conn.table_exists("task_runs")
     if runs_exist:
         with write_txn(conn):
             inflight = conn.execute(
@@ -603,21 +606,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
+def write_txn(conn: DatabaseBackend):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
     """
-    conn.execute("BEGIN IMMEDIATE")
+    conn.begin_immediate()
     try:
         yield conn
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     else:
-        conn.execute("COMMIT")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +655,7 @@ def _claimer_id() -> str:
 # ---------------------------------------------------------------------------
 
 def create_task(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     title: str,
     body: Optional[str] = None,
@@ -817,7 +820,7 @@ def create_task(
                     },
                 )
             return task_id
-        except sqlite3.IntegrityError:
+        except Exception:
             if attempt == 1:
                 raise
             # Retry with a fresh id.
@@ -825,7 +828,7 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
-def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
+def _find_missing_parents(conn: DatabaseBackend, parents: Iterable[str]) -> list[str]:
     parents = list(parents)
     if not parents:
         return []
@@ -838,13 +841,13 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     return [p for p in parents if p not in present]
 
 
-def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+def get_task(conn: DatabaseBackend, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
 
 
 def list_tasks(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     assignee: Optional[str] = None,
     status: Optional[str] = None,
@@ -874,7 +877,7 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(conn: DatabaseBackend, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -900,7 +903,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(conn: DatabaseBackend, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -930,7 +933,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         )
 
 
-def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def _would_cycle(conn: DatabaseBackend, parent_id: str, child_id: str) -> bool:
     """Return True if adding parent->child creates a cycle.
 
     A cycle exists iff ``parent_id`` is already a descendant of
@@ -953,7 +956,7 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(conn: DatabaseBackend, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -967,7 +970,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         return cur.rowcount > 0
 
 
-def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+def parent_ids(conn: DatabaseBackend, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
         (task_id,),
@@ -975,7 +978,7 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["parent_id"] for r in rows]
 
 
-def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+def child_ids(conn: DatabaseBackend, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
         (task_id,),
@@ -983,7 +986,7 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["child_id"] for r in rows]
 
 
-def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
+def parent_results(conn: DatabaseBackend, task_id: str) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
         """
@@ -1003,7 +1006,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: DatabaseBackend, task_id: str, author: str, body: str
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -1024,7 +1027,7 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
-def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+def list_comments(conn: DatabaseBackend, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
@@ -1041,7 +1044,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     ]
 
 
-def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+def list_events(conn: DatabaseBackend, task_id: str) -> list[Event]:
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -1066,7 +1069,7 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
 
 
 def _append_event(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     kind: str,
     payload: Optional[dict] = None,
@@ -1090,7 +1093,7 @@ def _append_event(
 
 
 def _end_run(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     outcome: str,
@@ -1146,7 +1149,7 @@ def _end_run(
     return run_id
 
 
-def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+def _current_run_id(conn: DatabaseBackend, task_id: str) -> Optional[int]:
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -1154,7 +1157,7 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
 
 
 def _synthesize_ended_run(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     outcome: str,
@@ -1208,7 +1211,7 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
-def recompute_ready(conn: sqlite3.Connection) -> int:
+def recompute_ready(conn: DatabaseBackend) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
@@ -1242,7 +1245,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
 # ---------------------------------------------------------------------------
 
 def claim_task(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     ttl_seconds: int = DEFAULT_CLAIM_TTL_SECONDS,
@@ -1331,7 +1334,7 @@ def claim_task(
 
 
 def heartbeat_claim(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     ttl_seconds: int = DEFAULT_CLAIM_TTL_SECONDS,
@@ -1361,7 +1364,7 @@ def heartbeat_claim(
         return False
 
 
-def release_stale_claims(conn: sqlite3.Connection) -> int:
+def release_stale_claims(conn: DatabaseBackend) -> int:
     """Reset any ``running`` task whose claim has expired.
 
     Returns the number of stale claims reclaimed.  Safe to call often.
@@ -1396,7 +1399,7 @@ def release_stale_claims(conn: sqlite3.Connection) -> int:
 
 
 def complete_task(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     result: Optional[str] = None,
@@ -1471,7 +1474,7 @@ def complete_task(
 
 
 def block_task(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     reason: Optional[str] = None,
@@ -1509,7 +1512,7 @@ def block_task(
         return True
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: DatabaseBackend, task_id: str) -> bool:
     """Transition ``blocked -> ready``.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -1548,7 +1551,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(conn: DatabaseBackend, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -1639,7 +1642,7 @@ def resolve_workspace(task: Task) -> Path:
 
 
 def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
+    conn: DatabaseBackend, task_id: str, path: Path | str
 ) -> None:
     with write_txn(conn):
         conn.execute(
@@ -1728,7 +1731,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
 
 def heartbeat_worker(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     note: Optional[str] = None,
@@ -1767,7 +1770,7 @@ def heartbeat_worker(
 
 
 def enforce_max_runtime(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     signal_fn=None,
 ) -> list[str]:
@@ -1857,7 +1860,7 @@ def enforce_max_runtime(
 
 
 def set_max_runtime(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     seconds: Optional[int],
 ) -> bool:
@@ -1871,7 +1874,7 @@ def set_max_runtime(
     return cur.rowcount == 1
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(conn: DatabaseBackend) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -1923,7 +1926,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
 
 def _record_spawn_failure(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     error: str,
     *,
@@ -1982,7 +1985,7 @@ def _record_spawn_failure(
     return blocked
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(conn: DatabaseBackend, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -2003,7 +2006,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
-def _clear_spawn_failures(conn: sqlite3.Connection, task_id: str) -> None:
+def _clear_spawn_failures(conn: DatabaseBackend, task_id: str) -> None:
     """Reset the failure counter after a successful spawn."""
     with write_txn(conn):
         conn.execute(
@@ -2014,7 +2017,7 @@ def _clear_spawn_failures(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def dispatch_once(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     spawn_fn=None,
     ttl_seconds: int = DEFAULT_CLAIM_TTL_SECONDS,
@@ -2273,7 +2276,7 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(conn: DatabaseBackend, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
     Order:
@@ -2461,7 +2464,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 # Stats + SLA helpers
 # ---------------------------------------------------------------------------
 
-def board_stats(conn: sqlite3.Connection) -> dict:
+def board_stats(conn: DatabaseBackend) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
     """
@@ -2520,7 +2523,7 @@ def task_age(task: Task) -> dict:
 # ---------------------------------------------------------------------------
 
 def add_notify_sub(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     task_id: str,
     platform: str,
@@ -2543,7 +2546,7 @@ def add_notify_sub(
 
 
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
+    conn: DatabaseBackend, task_id: Optional[str] = None,
 ) -> list[dict]:
     if task_id is not None:
         rows = conn.execute(
@@ -2555,7 +2558,7 @@ def list_notify_subs(
 
 
 def remove_notify_sub(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     task_id: str,
     platform: str,
@@ -2572,7 +2575,7 @@ def remove_notify_sub(
 
 
 def unseen_events_for_sub(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     task_id: str,
     platform: str,
@@ -2621,7 +2624,7 @@ def unseen_events_for_sub(
 
 
 def advance_notify_cursor(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     *,
     task_id: str,
     platform: str,
@@ -2642,7 +2645,7 @@ def advance_notify_cursor(
 # ---------------------------------------------------------------------------
 
 def gc_events(
-    conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
+    conn: DatabaseBackend, *, older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
@@ -2749,7 +2752,7 @@ def list_profiles_on_disk() -> list[str]:
     return names
 
 
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
+def known_assignees(conn: DatabaseBackend) -> list[dict]:
     """Return every assignee name known to the board or on disk.
 
     Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
@@ -2789,7 +2792,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def list_runs(
-    conn: sqlite3.Connection,
+    conn: DatabaseBackend,
     task_id: str,
     *,
     include_active: bool = True,
@@ -2809,14 +2812,14 @@ def list_runs(
     return [Run.from_row(r) for r in rows]
 
 
-def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
+def get_run(conn: DatabaseBackend, run_id: int) -> Optional[Run]:
     row = conn.execute(
         "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
 
 
-def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+def active_run(conn: DatabaseBackend, task_id: str) -> Optional[Run]:
     """Return the currently-open run for ``task_id`` (``ended_at IS NULL``)."""
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
@@ -2826,7 +2829,7 @@ def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
-def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+def latest_run(conn: DatabaseBackend, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? "

@@ -31,8 +31,9 @@ import logging
 import os
 import socket as _socket
 import re
-import sqlite3
 import time
+
+from hermes_db import create_backend
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -308,9 +309,15 @@ class ResponseStore:
             except Exception:
                 db_path = ":memory:"
         try:
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._conn = create_backend(
+                provider="sqlite",
+                db_path=db_path,
+            )
         except Exception:
-            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._conn = create_backend(
+                provider="sqlite",
+                db_path=":memory:",
+            )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (

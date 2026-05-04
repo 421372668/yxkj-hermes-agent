@@ -25,6 +25,9 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from hermes_db import create_backend, create_fts_backend
+from hermes_db.interface import DatabaseBackend
+from hermes_db.fts_backend import FTSBackend, SQLiteFTSBackend
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -100,6 +103,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 """
 
+# FTS SQL constants kept for SQLite mode; for PostgreSQL these are
+# handled by PostgreSQLFTSBackend.
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content
@@ -179,40 +184,40 @@ class SessionDB:
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
-    def __init__(self, db_path: Path = None):
+    def __init__(self, db_path: Path = None, *, backend: DatabaseBackend = None,
+                 fts_backend: FTSBackend = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
         self._write_count = 0
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            # Short timeout — application-level retry with random jitter
-            # handles contention instead of sitting in SQLite's internal
-            # busy handler for up to 30s.
-            timeout=1.0,
-            # Autocommit mode: Python's default isolation_level="" auto-starts
-            # transactions on DML, which conflicts with our explicit
-            # BEGIN IMMEDIATE.  None = we manage transactions ourselves.
-            isolation_level=None,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+
+        # Initialize or create the database backend
+        if backend is not None:
+            self._backend = backend
+        else:
+            self._backend = create_backend(
+                provider="sqlite",
+                db_path=str(self.db_path),
+            )
+        # Initialize the full-text search backend
+        if fts_backend is not None:
+            self._fts = fts_backend
+        else:
+            self._fts = create_fts_backend("sqlite")
 
         self._init_schema()
 
     # ── Core write helper ──
 
-    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _execute_write(self, fn: Callable[[DatabaseBackend], T]) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
-        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
+        *fn* receives the backend and should perform INSERT/UPDATE/DELETE
         statements.  The caller must NOT call ``commit()`` — that's handled
         here after *fn* returns.
 
-        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
+        BEGIN IMMEDIATE acquires the write lock at transaction start
         (not at commit time), so lock contention surfaces immediately.
         On ``database is locked``, we release the Python lock, sleep a
         random 20-150ms, and retry — breaking the convoy pattern that
@@ -224,22 +229,19 @@ class SessionDB:
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    self._backend.begin_immediate()
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(self._backend)
+                        self._backend.commit()
                     except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
+                        self._backend.rollback()
                         raise
                 # Success — periodic best-effort checkpoint.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
                 return result
-            except sqlite3.OperationalError as exc:
+            except BaseException as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
@@ -253,45 +255,49 @@ class SessionDB:
                 # Non-lock error or retries exhausted — propagate.
                 raise
         # Retries exhausted (shouldn't normally reach here).
-        raise last_err or sqlite3.OperationalError(
+        raise last_err or RuntimeError(
             "database is locked after max retries"
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
+        """Best-effort WAL checkpoint for SQLite backend.  Never blocks, never raises.
 
         Flushes committed WAL frames back into the main DB file for any
         frames that no other connection currently needs.  Keeps the WAL
         from growing unbounded when many processes hold persistent
-        connections.
+        connections.  No-op for non-SQLite backends.
         """
         try:
-            with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
-                if result and result[1] > 0:
-                    logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
-                    )
+            raw = self._backend.raw_connection
+            if raw and hasattr(raw, 'execute'):
+                with self._lock:
+                    result = raw.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    if result and result[1] > 0:
+                        logger.debug(
+                            "WAL checkpoint: %d/%d pages checkpointed",
+                            result[2], result[1],
+                        )
         except Exception:
             pass  # Best effort — never fatal.
 
     def close(self):
         """Close the database connection.
 
-        Attempts a PASSIVE WAL checkpoint first so that exiting processes
-        help keep the WAL file from growing unbounded.
+        Attempts a best-effort checkpoint for SQLite backends so that
+        exiting processes help keep the WAL file from growing unbounded.
         """
         with self._lock:
-            if self._conn:
+            if self._backend:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    raw = self._backend.raw_connection
+                    if raw and hasattr(raw, 'execute'):
+                        raw.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception:
                     pass
-                self._conn.close()
-                self._conn = None
+                self._backend.close()
+                self._backend = None
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -305,8 +311,15 @@ class SessionDB:
 
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
+
+        Falls back to regex-based parsing when SQLite is not available
+        (PostgreSQL mode), although this is less reliable.
         """
-        ref = sqlite3.connect(":memory:")
+        try:
+            ref = sqlite3.connect(":memory:")
+        except Exception:
+            # Fall back to regex-based parsing when sqlite3 unavailable
+            return SessionDB._parse_schema_columns_regex(schema_sql)
         try:
             ref.executescript(schema_sql)
             table_columns: Dict[str, Dict[str, str]] = {}
@@ -336,33 +349,74 @@ class SessionDB:
         finally:
             ref.close()
 
-    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+    @staticmethod
+    def _parse_schema_columns_regex(schema_sql: str) -> Dict[str, Dict[str, str]]:
+        """Fallback regex-based column parser when sqlite3 is unavailable.
+
+        Less robust than the in-memory SQLite approach but sufficient for
+        schema reconciliation when running against PostgreSQL.
+        """
+        import re
+        tables: Dict[str, Dict[str, str]] = {}
+        # Match CREATE TABLE [IF NOT EXISTS] name ( ... )
+        pattern = re.compile(
+            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\)\s*;",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(schema_sql):
+            tbl_name = match.group(1)
+            col_block = match.group(2)
+            cols: Dict[str, str] = {}
+            for line in col_block.split(","):
+                line = line.strip()
+                if not line or line.upper().startswith(("PRIMARY", "FOREIGN", "UNIQUE", "CONSTRAINT", "INDEX", "CHECK")):
+                    continue
+                parts = line.split()
+                if not parts:
+                    continue
+                col_name = parts[0].strip('"`[]')
+                col_def = " ".join(parts[1:])
+                cols[col_name] = col_def
+            tables[tbl_name] = cols
+        return tables
+
+    def _reconcile_columns(self, cursor) -> None:
         """Ensure live tables have every column declared in SCHEMA_SQL.
 
         Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
         in SCHEMA_SQL is the single source of truth for the desired schema.
         On every startup this method diffs the live columns (via PRAGMA
-        table_info) against the declared columns, and ADDs any that are
-        missing.
+        table_info for SQLite or INFORMATION_SCHEMA for PostgreSQL) against
+        the declared columns, and ADDs any that are missing.
 
         This makes column additions a declarative operation — just add
         the column to SCHEMA_SQL and it appears on the next startup.
         Version-gated migration blocks are no longer needed for ADD COLUMN.
         """
+        # Use get_table_columns from the backend when available, else PRAGMA
+        try:
+            live_cols_map = self._backend.get_table_columns("sessions")
+            using_backend = bool(live_cols_map)
+        except Exception:
+            using_backend = False
+
         expected = self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
             try:
-                rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue  # Table doesn't exist yet (shouldn't happen after executescript)
-            live_cols = set()
-            for row in rows:
-                # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
-                name = row[1] if isinstance(row, (tuple, list)) else row["name"]
-                live_cols.add(name)
+                if using_backend:
+                    live_cols_info = self._backend.get_table_columns(table_name)
+                    live_cols = set(live_cols_info.keys())
+                else:
+                    rows = cursor.execute(
+                        f'PRAGMA table_info("{table_name}")'
+                    ).fetchall()
+                    live_cols = set()
+                    for row in rows:
+                        name = row["name"]
+                        live_cols.add(name)
+            except Exception:
+                continue  # Table doesn't exist yet
 
             for col_name, col_type in declared_cols.items():
                 if col_name not in live_cols:
@@ -371,11 +425,7 @@ class SessionDB:
                         cursor.execute(
                             f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
-                    except sqlite3.OperationalError as exc:
-                        # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
+                    except Exception as exc:
                         logger.debug(
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
@@ -392,30 +442,31 @@ class SessionDB:
 
         The schema_version table is retained for future data migrations
         (transforming existing rows) which cannot be handled declaratively.
-        """
-        cursor = self._conn.cursor()
 
-        cursor.executescript(SCHEMA_SQL)
+        For SQLite backends, also creates FTS5 virtual tables. For
+        PostgreSQL, FTS indexes are managed by the FTS backend.
+        """
+        # Execute core DDL (tables + indexes)
+        self._backend.executescript(SCHEMA_SQL)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
-        # This is idempotent and self-healing: even if a version-gated
-        # migration was skipped (e.g. due to version renumbering), the
-        # column gets created here.
-        self._reconcile_columns(cursor)
+        # This is idempotent and self-healing.
+        self._reconcile_columns(self._backend)
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
         # version.  No version-gated column additions remain.
-        cursor.execute("SELECT version FROM schema_version LIMIT 1")
-        row = cursor.fetchone()
+        row = self._backend.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
         if row is None:
-            cursor.execute(
+            self._backend.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
             )
         else:
-            current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+            current_version = row[0] if not row.keys() else row["version"]
             # Data migrations that can't be expressed declaratively (row
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
@@ -425,24 +476,18 @@ class SessionDB:
                 # virtual table + triggers are created unconditionally via
                 # FTS_TRIGRAM_SQL below, but existing rows need a one-time
                 # backfill into the FTS index.
-                try:
-                    cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
-                    _fts_trigram_exists = True
-                except sqlite3.OperationalError:
-                    _fts_trigram_exists = False
+                _fts_trigram_exists = self._fts.ensure_trigram_exists(
+                    self._backend, self._backend
+                )
                 if not _fts_trigram_exists:
-                    cursor.executescript(FTS_TRIGRAM_SQL)
-                    cursor.execute(
+                    self._backend.executescript(FTS_TRIGRAM_SQL)
+                    self._backend.execute(
                         "INSERT INTO messages_fts_trigram(rowid, content) "
                         "SELECT id, content FROM messages WHERE content IS NOT NULL"
                     )
             if current_version < 11:
                 # v11: re-index FTS5 tables to cover tool_name + tool_calls and
-                # switch from external-content to inline mode. Existing DBs have
-                # old-schema FTS tables and triggers that IF NOT EXISTS won't
-                # overwrite, so we drop them explicitly and let the post-migration
-                # existence checks (below) recreate them from FTS_SQL /
-                # FTS_TRIGRAM_SQL, then backfill every message row. Fixes #16751.
+                # switch from external-content to inline mode.
                 for _trig in (
                     "messages_fts_insert",
                     "messages_fts_delete",
@@ -452,63 +497,52 @@ class SessionDB:
                     "messages_fts_trigram_update",
                 ):
                     try:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {_trig}")
-                    except sqlite3.OperationalError:
+                        self._backend.execute(f"DROP TRIGGER IF EXISTS {_trig}")
+                    except Exception:
                         pass
                 for _tbl in ("messages_fts", "messages_fts_trigram"):
                     try:
-                        cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
-                    except sqlite3.OperationalError:
+                        self._backend.execute(f"DROP TABLE IF EXISTS {_tbl}")
+                    except Exception:
                         pass
                 # Recreate virtual tables + triggers with the new inline-mode
                 # schema that indexes content || tool_name || tool_calls.
-                cursor.executescript(FTS_SQL)
-                cursor.executescript(FTS_TRIGRAM_SQL)
+                self._backend.executescript(FTS_SQL)
+                self._backend.executescript(FTS_TRIGRAM_SQL)
                 # Backfill both indexes from every existing messages row.
-                cursor.execute(
-                    "INSERT INTO messages_fts(rowid, content) "
-                    "SELECT id, "
+                content_expr = (
                     "COALESCE(content, '') || ' ' || "
                     "COALESCE(tool_name, '') || ' ' || "
-                    "COALESCE(tool_calls, '') "
-                    "FROM messages"
+                    "COALESCE(tool_calls, '')"
                 )
-                cursor.execute(
-                    "INSERT INTO messages_fts_trigram(rowid, content) "
-                    "SELECT id, "
-                    "COALESCE(content, '') || ' ' || "
-                    "COALESCE(tool_name, '') || ' ' || "
-                    "COALESCE(tool_calls, '') "
-                    "FROM messages"
+                self._backend.execute(
+                    f"INSERT INTO messages_fts(rowid, content) "
+                    f"SELECT id, {content_expr} FROM messages"
+                )
+                self._backend.execute(
+                    f"INSERT INTO messages_fts_trigram(rowid, content) "
+                    f"SELECT id, {content_expr} FROM messages"
                 )
             if current_version < SCHEMA_VERSION:
-                cursor.execute(
+                self._backend.execute(
                     "UPDATE schema_version SET version = ?",
                     (SCHEMA_VERSION,),
                 )
 
         # Unique title index — always ensure it exists
         try:
-            cursor.execute(
+            self._backend.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
                 "ON sessions(title) WHERE title IS NOT NULL"
             )
-        except sqlite3.OperationalError:
+        except Exception:
             pass  # Index already exists
 
-        # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
-        try:
-            cursor.execute("SELECT * FROM messages_fts LIMIT 0")
-        except sqlite3.OperationalError:
-            cursor.executescript(FTS_SQL)
+        # FTS setup — delegate to the FTS backend (handles both SQLite
+        # FTS5 virtual tables and PostgreSQL GIN indexes).
+        self._fts.create_fts_tables(self._backend)
 
-        # Trigram FTS5 for CJK/substring search
-        try:
-            cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
-        except sqlite3.OperationalError:
-            cursor.executescript(FTS_TRIGRAM_SQL)
-
-        self._conn.commit()
+        self._backend.commit()
 
     # =========================================================================
     # Session lifecycle
@@ -721,7 +755,7 @@ class SessionDB:
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
@@ -745,7 +779,7 @@ class SessionDB:
             .replace("_", "\\_")
         )
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
                 (f"{escaped}%",),
             )
@@ -833,7 +867,7 @@ class SessionDB:
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT title FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
@@ -842,7 +876,7 @@ class SessionDB:
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT * FROM sessions WHERE title = ?", (title,)
             )
             row = cursor.fetchone()
@@ -863,7 +897,7 @@ class SessionDB:
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT id, title, started_at FROM sessions "
                 "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
                 (f"{escaped} #%",),
@@ -894,7 +928,7 @@ class SessionDB:
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
         escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
                 (base, f"{escaped} #%"),
             )
@@ -932,7 +966,7 @@ class SessionDB:
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
             with self._lock:
-                cursor = self._conn.execute(
+                cursor = self._backend.execute(
                     "SELECT id FROM sessions "
                     "WHERE parent_session_id = ? "
                     "  AND started_at >= ("
@@ -1086,7 +1120,7 @@ class SessionDB:
             """
             params.extend([limit, offset])
         with self._lock:
-            cursor = self._conn.execute(query, params)
+            cursor = self._backend.execute(query, params)
             rows = cursor.fetchall()
         sessions = []
         for row in rows:
@@ -1160,7 +1194,7 @@ class SessionDB:
             WHERE s.id = ?
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._backend.execute(query, (session_id,))
             row = cursor.fetchone()
         if not row:
             return None
@@ -1388,7 +1422,7 @@ class SessionDB:
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
         with self._lock:
-            cursor = self._conn.execute(
+            cursor = self._backend.execute(
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
                 (session_id,),
             )
@@ -1431,7 +1465,7 @@ class SessionDB:
         with self._lock:
             # If this session already has messages, nothing to redirect.
             try:
-                row = self._conn.execute(
+                row = self._backend.execute(
                     "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
                     (session_id,),
                 ).fetchone()
@@ -1446,7 +1480,7 @@ class SessionDB:
             seen = {current}
             for _ in range(32):
                 try:
-                    child_row = self._conn.execute(
+                    child_row = self._backend.execute(
                         "SELECT id FROM sessions "
                         "WHERE parent_session_id = ? "
                         "ORDER BY started_at DESC, id DESC LIMIT 1",
@@ -1461,7 +1495,7 @@ class SessionDB:
                     return session_id
                 seen.add(child_id)
                 try:
-                    msg_row = self._conn.execute(
+                    msg_row = self._backend.execute(
                         "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
                         (child_id,),
                     ).fetchone()
@@ -1485,7 +1519,7 @@ class SessionDB:
 
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
+            rows = self._backend.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items "
@@ -1555,7 +1589,7 @@ class SessionDB:
                     break
                 seen.add(current)
                 chain.append(current)
-                row = self._conn.execute(
+                row = self._backend.execute(
                     "SELECT parent_session_id FROM sessions WHERE id = ?",
                     (current,),
                 ).fetchone()
@@ -1676,13 +1710,16 @@ class SessionDB:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """
-        Full-text search across session messages using FTS5.
+        Full-text search across session messages using the configured FTS backend.
 
-        Supports FTS5 query syntax:
+        Supports FTS5 query syntax when using SQLite:
           - Simple keywords: "docker deployment"
           - Phrases: '"exact phrase"'
           - Boolean: "docker OR kubernetes", "python NOT java"
           - Prefix: "deploy*"
+
+        Delegates to the FTS backend (SQLite FTS5 or PostgreSQL tsvector)
+        configured at construction time.
 
         Returns matching messages with session metadata, content snippet,
         and surrounding context (1 message before and after the match).
@@ -1690,166 +1727,45 @@ class SessionDB:
         if not query or not query.strip():
             return []
 
-        query = self._sanitize_fts5_query(query)
-        if not query:
-            return []
+        # Determine if this is a CJK query
+        is_cjk = self._fts.contains_cjk(query) if hasattr(self._fts, 'contains_cjk') else False
 
-        # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
-        params: list = [query]
-
-        if source_filter is not None:
-            source_placeholders = ",".join("?" for _ in source_filter)
-            where_clauses.append(f"s.source IN ({source_placeholders})")
-            params.extend(source_filter)
-
-        if exclude_sources is not None:
-            exclude_placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
-            params.extend(exclude_sources)
-
-        if role_filter:
-            role_placeholders = ",".join("?" for _ in role_filter)
-            where_clauses.append(f"m.role IN ({role_placeholders})")
-            params.extend(role_filter)
-
-        where_sql = " AND ".join(where_clauses)
-        params.extend([limit, offset])
-
-        sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            ORDER BY rank
-            LIMIT ? OFFSET ?
-        """
-
-        # CJK queries bypass the unicode61 FTS5 table.  The default tokenizer
-        # splits CJK characters into individual tokens, so "大别山项目" becomes
-        # "大 AND 别 AND 山 AND 项 AND 目" — producing false positives and
-        # missing exact phrase matches.
-        #
-        # For queries with 3+ CJK characters, we use the trigram FTS5 table
-        # (indexed substring matching with ranking and snippets).  For shorter
-        # CJK queries (1-2 chars), trigram can't match (it needs ≥9 UTF-8
-        # bytes = 3 CJK chars), so we fall back to LIKE.
-        is_cjk = self._contains_cjk(query)
-        if is_cjk:
+        if is_cjk and hasattr(self._fts, 'count_cjk'):
             raw_query = query.strip('"').strip()
-            cjk_count = self._count_cjk(raw_query)
-
+            cjk_count = self._fts.count_cjk(raw_query)
             if cjk_count >= 3:
-                # Trigram FTS5 path — quote each non-operator token to handle
-                # FTS5 special chars (%, *, etc.) while preserving boolean
-                # operators (AND, OR, NOT) for multi-term queries.
-                tokens = raw_query.split()
-                parts = []
-                for tok in tokens:
-                    if tok.upper() in ("AND", "OR", "NOT"):
-                        parts.append(tok)
-                    else:
-                        parts.append('"' + tok.replace('"', '""') + '"')
-                trigram_query = " ".join(parts)
-                tri_where = ["messages_fts_trigram MATCH ?"]
-                tri_params: list = [trigram_query]
-                if source_filter is not None:
-                    tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    tri_params.extend(source_filter)
-                if exclude_sources is not None:
-                    tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                    tri_params.extend(exclude_sources)
-                if role_filter:
-                    tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                    tri_params.extend(role_filter)
-                tri_sql = f"""
-                    SELECT
-                        m.id,
-                        m.session_id,
-                        m.role,
-                        snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
-                        m.content,
-                        m.timestamp,
-                        m.tool_name,
-                        s.source,
-                        s.model,
-                        s.started_at AS session_started
-                    FROM messages_fts_trigram
-                    JOIN messages m ON m.id = messages_fts_trigram.rowid
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(tri_where)}
-                    ORDER BY rank
-                    LIMIT ? OFFSET ?
-                """
-                tri_params.extend([limit, offset])
-                with self._lock:
-                    try:
-                        tri_cursor = self._conn.execute(tri_sql, tri_params)
-                    except sqlite3.OperationalError:
-                        matches = []
-                    else:
-                        matches = [dict(row) for row in tri_cursor.fetchall()]
+                # Trigram path (FTS5 trigram or pg_trgm)
+                matches = self._fts.search_trigram(
+                    self._backend, query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit, offset=offset,
+                )
             else:
-                # Short CJK query (1-2 chars) — trigram needs ≥3 CJK chars.
-                # Fall back to LIKE substring search.
-                escaped = raw_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                like_where = ["(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"]
-                like_params: list = [f"%{escaped}%", f"%{escaped}%", f"%{escaped}%"]
-                if source_filter is not None:
-                    like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    like_params.extend(source_filter)
-                if exclude_sources is not None:
-                    like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                    like_params.extend(exclude_sources)
-                if role_filter:
-                    like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                    like_params.extend(role_filter)
-                like_sql = f"""
-                    SELECT m.id, m.session_id, m.role,
-                           substr(m.content,
-                                  max(1, instr(m.content, ?) - 40),
-                                  120) AS snippet,
-                           m.content, m.timestamp, m.tool_name,
-                           s.source, s.model, s.started_at AS session_started
-                    FROM messages m
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(like_where)}
-                    ORDER BY m.timestamp DESC
-                    LIMIT ? OFFSET ?
-                """
-                like_params.extend([limit, offset])
-                # instr() parameter goes first in the bound list
-                like_params = [raw_query] + like_params
-                with self._lock:
-                    like_cursor = self._conn.execute(like_sql, like_params)
-                    matches = [dict(row) for row in like_cursor.fetchall()]
+                # Short CJK query — LIKE fallback
+                matches = self._fts.search_like(
+                    self._backend, raw_query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit, offset=offset,
+                )
         else:
-            with self._lock:
-                try:
-                    cursor = self._conn.execute(sql, params)
-                except sqlite3.OperationalError:
-                    # FTS5 query syntax error despite sanitization — return empty
-                    return []
-                else:
-                    matches = [dict(row) for row in cursor.fetchall()]
+            # Standard FTS search
+            matches = self._fts.search(
+                self._backend, query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit, offset=offset,
+            )
 
         # Add surrounding context (1 message before + after each match).
-        # Done outside the lock so we don't hold it across N sequential queries.
         for match in matches:
             try:
                 with self._lock:
-                    ctx_cursor = self._conn.execute(
+                    ctx_rows = self._backend.execute(
                         """WITH target AS (
                                SELECT session_id, timestamp, id
                                FROM messages
@@ -1881,13 +1797,11 @@ class SessionDB:
                                LIMIT 1
                            )""",
                         (match["id"], match["id"]),
-                    )
+                    ).fetchall()
                     context_msgs = []
-                    for r in ctx_cursor.fetchall():
+                    for r in ctx_rows:
                         raw = r["content"]
                         decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
                         if isinstance(decoded, list):
                             text_parts = [
                                 p.get("text", "") for p in decoded
@@ -1934,14 +1848,14 @@ class SessionDB:
         )
         with self._lock:
             if source:
-                cursor = self._conn.execute(
+                cursor = self._backend.execute(
                     f"{select_with_last_active}"
                     "WHERE s.source = ? "
                     "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
                     (source, limit, offset),
                 )
             else:
-                cursor = self._conn.execute(
+                cursor = self._backend.execute(
                     f"{select_with_last_active}"
                     "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
                     (limit, offset),
@@ -1956,22 +1870,22 @@ class SessionDB:
         """Count sessions, optionally filtered by source."""
         with self._lock:
             if source:
-                cursor = self._conn.execute(
+                cursor = self._backend.execute(
                     "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
                 )
             else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+                cursor = self._backend.execute("SELECT COUNT(*) FROM sessions")
             return cursor.fetchone()[0]
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
         with self._lock:
             if session_id:
-                cursor = self._conn.execute(
+                cursor = self._backend.execute(
                     "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
                 )
             else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+                cursor = self._backend.execute("SELECT COUNT(*) FROM messages")
             return cursor.fetchone()[0]
 
     # =========================================================================
@@ -2131,12 +2045,12 @@ class SessionDB:
     def get_meta(self, key: str) -> Optional[str]:
         """Read a value from the state_meta key/value store."""
         with self._lock:
-            row = self._conn.execute(
+            row = self._backend.execute(
                 "SELECT value FROM state_meta WHERE key = ?", (key,)
             ).fetchone()
         if row is None:
             return None
-        return row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        return row["value"]
 
     def set_meta(self, key: str, value: str) -> None:
         """Write a value to the state_meta key/value store."""
@@ -2168,10 +2082,10 @@ class SessionDB:
         with self._lock:
             # Best-effort WAL checkpoint first, then VACUUM.
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._backend.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
                 pass
-            self._conn.execute("VACUUM")
+            self._backend.execute("VACUUM")
 
     def maybe_auto_prune_and_vacuum(
         self,
